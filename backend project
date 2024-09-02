@@ -1,7 +1,213 @@
-npm install
-if (process.env.NODE_ENV === 'development') {
-  app.use(express.errorHandler({ dumpExceptions: true, showStack: true }));
-}
-if (process.env.NODE_ENV === 'production') {
-  app.use(express.errorHandler());
-}
+// api-gateway/index.js
+const express = require('express');
+const axios = require('axios');
+const authMiddleware = require('../common/middleware/auth');
+const rateLimit = require('express-rate-limit');
+const app = express();
+const PORT = 3000;
+// Middleware for authentication
+app.use(authMiddleware);
+// Rate limiting middleware
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per window
+});
+app.use(apiLimiter);
+// Route requests to appropriate services
+app.use('/trade', (req, res) => {
+  axios({
+    method: req.method,
+    url: `http://localhost:3001${req.url}`,
+    data: req.body,
+  }).then(response => res.send(response.data)).catch(error => res.status(500).send(error.message));
+});
+app.use('/inventory', (req, res) => {
+  axios({
+    method: req.method,
+    url: `http://localhost:3002${req.url}`,
+    data: req.body,
+  }).then(response => res.send(response.data)).catch(error => res.status(500).send(error.message));
+});
+app.use('/cargo', (req, res) => {
+  axios({
+    method: req.method,
+    url: `http://localhost:3003${req.url}`,
+    data: req.body,
+  }).then(response => res.send(response.data)).catch(error => res.status(500).send(error.message));
+});
+app.use('/notifications', (req, res) => {
+  axios({
+    method: req.method,
+    url: `http://localhost:3004${req.url}`,
+    data: req.body,
+  }).then(response => res.send(response.data)).catch(error => res.status(500).send(error.message));
+});
+app.listen(PORT, () => {
+  console.log(`API Gateway is running on port ${PORT}`);
+});
+// trade-service/index.js
+const express = require('express');
+const mongoose = require('mongoose');
+const Trade = require('./models/Trade');
+const { produceMessage } = require('../message-broker/kafkaClient');
+const app = express();
+app.use(express.json());
+mongoose.connect('mongodb://localhost:27017/trade-db', { useNewUrlParser: true, useUnifiedTopology: true });
+app.post('/buy', async (req, res) => {
+  const { buyerId, sellerId, goods, quantity } = req.body;
+  // Validate request and process trade
+  const trade = new Trade({ buyerId, sellerId, goods, quantity, type: 'buy' });
+  await trade.save();
+  // Emit event to update inventory
+  produceMessage('trade-events', { type: 'BUY_TRADE_COMPLETED', payload: trade });
+  res.status(201).json({ message: 'Trade completed successfully', trade });
+});
+app.post('/sell', async (req, res) => {
+  const { buyerId, sellerId, goods, quantity } = req.body;
+  // Validate request and process trade
+  const trade = new Trade({ buyerId, sellerId, goods, quantity, type: 'sell' });
+  await trade.save();
+  // Emit event to update inventory
+  produceMessage('trade-events', { type: 'SELL_TRADE_COMPLETED', payload: trade });
+  res.status(201).json({ message: 'Trade completed successfully', trade });
+});
+app.listen(3001, () => {
+  console.log('Trade Service is running on port 3001');
+});
+// inventory-service/index.js
+const express = require('express');
+const mongoose = require('mongoose');
+const Inventory = require('./models/Inventory');
+const { consumeMessages } = require('../message-broker/kafkaClient');
+const app = express();
+app.use(express.json());
+mongoose.connect('mongodb://localhost:27017/inventory-db', { useNewUrlParser: true, useUnifiedTopology: true });
+// Update inventory levels based on events
+consumeMessages('trade-events', async (message) => {
+  const event = JSON.parse(message.value);
+  switch (event.type) {
+    case 'BUY_TRADE_COMPLETED':
+      await updateInventory(event.payload);
+      break;
+    case 'SELL_TRADE_COMPLETED':
+      await updateInventory(event.payload);
+      break;
+  }
+});
+const updateInventory = async (trade) => {
+  const { goods, quantity, type } = trade;
+  const inventoryItem = await Inventory.findOne({ goods });
+  if (type === 'buy') {
+    inventoryItem.quantity -= quantity;
+  } else if (type === 'sell') {
+    inventoryItem.quantity += quantity;
+  }
+  await inventoryItem.save();
+};
+app.get('/inventory/:stationId', async (req, res) => {
+  const { stationId } = req.params;
+  const inventory = await Inventory.find({ stationId });
+  res.status(200).json(inventory);
+});
+app.listen(3002, () => {
+  console.log('Inventory Service is running on port 3002');
+});
+// cargo-service/index.js
+const express = require('express');
+const mongoose = require('mongoose');
+const Cargo = require('./models/Cargo');
+const { produceMessage, consumeMessages } = require('../message-broker/kafkaClient');
+const app = express();
+app.use(express.json());
+mongoose.connect('mongodb://localhost:27017/cargo-db', { useNewUrlParser: true, useUnifiedTopology: true });
+app.post('/ship', async (req, res) => {
+  const { origin, destination, goods, quantity } = req.body;
+  const shipment = new Cargo({ origin, destination, goods, quantity, status: 'in transit' });
+  await shipment.save();
+  // Emit event to notify other services
+  produceMessage('cargo-events', { type: 'CARGO_SHIPMENT_INITIATED', payload: shipment });
+  res.status(201).json({ message: 'Shipment initiated successfully', shipment });
+});
+app.get('/status/:shipmentId', async (req, res) => {
+  const { shipmentId } = req.params;
+  const shipment = await Cargo.findById(shipmentId);
+  res.status(200).json(shipment);
+});
+// Process events for updating shipment status
+consumeMessages('cargo-events', async (message) => {
+  const event = JSON.parse(message.value);
+  if (event.type === 'CARGO_STATUS_UPDATE') {
+    const shipment = await Cargo.findById(event.payload.shipmentId);
+    shipment.status = event.payload.status;
+    await shipment.save();
+  }
+});
+app.listen(3003, () => {
+  console.log('Cargo Service is running on port 3003');
+});
+// notification-service/index.js
+const express = require('express');
+const { Server } = require('socket.io');
+const http = require('http');
+const { consumeMessages } = require('../message-broker/kafkaClient');
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+io.on('connection', (socket) => {
+  console.log('Client connected');
+});
+// Listen to events and notify users
+consumeMessages('notifications', (message) => {
+  const event = JSON.parse(message.value);
+  io.emit('notification', event);
+});
+app.get('/history/:userId', (req, res) => {
+  // Fetch notification history for user
+  res.status(200).json({ message: 'Notification history for user' });
+});
+server.listen(3004, () => {
+  console.log('Notification Service is running on port 3004');
+});
+// message-broker/kafkaClient.js
+const { Kafka } = require('kafkajs');
+const kafka = new Kafka({
+  clientId: 'intergalactic-trade-network',
+  brokers: ['localhost:9092']
+});
+const producer = kafka.producer();
+const consumer = kafka.consumer({ groupId: 'trade-group' });
+const produceMessage = async (topic, message) => {
+  await producer.connect();
+  await producer.send({
+    topic,
+    messages: [{ value: JSON.stringify(message) }],
+  });
+  await producer.disconnect();
+};
+const consumeMessages = async (topic, callback) => {
+  await consumer.connect();
+  await consumer.subscribe({ topic, fromBeginning: true });
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      callback(message);
+    },
+  });
+};
+module.exports = { produceMessage, consumeMessages };
+// common/middleware/auth.js
+const authMiddleware = (req, res, next) => {
+  // Simple authentication middleware
+  const token = req.headers['authorization'];
+  if (token) {
+    // Validate token logic here
+    next();
+  } else {
+    res.status(403).json({ message: 'Unauthorized' });
+  }
+};
+module.exports = authMiddleware;
+// common/utils/logger.js
+const logger = (message) => {
+  console.log(`[${new Date().toISOString()}] ${message}`);
+};
+module.exports = logger;
