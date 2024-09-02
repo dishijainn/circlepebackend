@@ -1,0 +1,17 @@
+// trade-service/models/Trade.js
+
+const mongoose = require('mongoose');
+
+const tradeSchema = new mongoose.Schema({
+  buyerId: String,
+  sellerId: String,
+  goods: String,
+  quantity: Number,
+  type: String,
+}, {
+  timestamps: true
+});
+
+tradeSchema.index({ goods: 1 }); // Index for efficient querying on goods
+
+module.exports = mongoose.model('Trade', tradeSchema);
