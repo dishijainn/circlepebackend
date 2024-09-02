@@ -1,0 +1,22 @@
+// common/middleware/auth.js
+
+const authMiddleware = (req, res, next) => {
+  // Simple authentication middleware
+  const token = req.headers['authorization'];
+  if (token) {
+    // Validate token logic here
+    next();
+  } else {
+    res.status(403).json({ message: 'Unauthorized' });
+  }
+};
+
+module.exports = authMiddleware;
+
+// common/utils/logger.js
+
+const logger = (message) => {
+  console.log(`[${new Date().toISOString()}] ${message}`);
+};
+
+module.exports = logger;
